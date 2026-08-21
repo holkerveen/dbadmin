@@ -45,13 +45,16 @@ jobs:
       # The test compose files carry throwaway credentials, so no .env is needed.
       - run: ./dbadmin.sh test
 
+  # Deliberately no job-level `if`: a skipped job propagates its skip through
+  # the whole downstream `needs` graph, which would silently skip `merge` too.
+  # Gating the step instead makes this a no-op success on non-tag pushes.
   assert-version:
-    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: package.json version must match the git tag
+        if: startsWith(github.ref, 'refs/tags/v')
         run: |
           pkg=$(npm pkg get version | tr -d '"')
           tag=${GITHUB_REF_NAME#v}
@@ -63,13 +66,9 @@ jobs:
 
   build:
     needs: [test, assert-version]
-    # assert-version is skipped on non-tag pushes, and a skipped `needs` would
-    # otherwise skip this job too -- hence the explicit result checks.
-    if: >-
-      ${{ !cancelled()
-          && github.event_name != 'pull_request'
-          && needs.test.result == 'success'
-          && needs.assert-version.result != 'failure' }}
+    # PRs from forks get a read-only token, so there is nothing to push to.
+    # This skip intentionally cascades to `merge`.
+    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
