@@ -119,15 +119,20 @@ CI (`.github/workflows/ci.yml`) runs lint, typecheck, and the full e2e suite on 
 - Push to `main` → publishes `edge` and `sha-<short>`.
 - Push a `vX.Y.Z` tag → publishes the semver tags and moves `latest`.
 
-To cut a release, bump `package.json` first — a dedicated CI job fails the run if the tag and `package.json` version disagree:
+To cut a release, bump `package.json` first — a dedicated CI job fails the run if the tag and `package.json` version disagree. Bump and tag are deliberately two separate steps, so the tag only ever lands on a commit CI has already proven green:
 
 ```sh
-npm version 1.2.3 --no-git-tag-version
+npm version 1.2.3 --no-git-tag-version   # the flag is required -- see below
 git commit -am 'Release 1.2.3'
-git push
+git push                                 # wait for CI to go green on main
 git tag v1.2.3
 git push origin v1.2.3
 ```
+
+> [!IMPORTANT]
+> **Always pass `--no-git-tag-version`.** Despite the name, it suppresses the *commit* as well as the tag — which is why the `git commit` above is a separate step. Without the flag, `npm version` creates the bump commit **and** the `v1.2.3` tag in one go, so pushing sends both at once and the tag races ahead of the main build. If that run then fails, you own a published tag pointing at code that never passed, and deleting a published tag is messy: anyone who already fetched it keeps it, and GHCR may hold partial artifacts for it.
+>
+> Trade-off worth knowing: plain `npm version` cannot produce a tag/`package.json` mismatch, since it writes both atomically. The two-step flow can — that is precisely what the `assert-version` CI job is there to catch.
 
 Each platform builds natively (`ubuntu-latest` and `ubuntu-24.04-arm`) rather than under QEMU, and the two are merged into one manifest list. The arm64 runners are free only while this repository is public.
 
