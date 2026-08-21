@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>dbadmin</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; display: flex; height: 100vh; font: 14px/1.4 system-ui, sans-serif; background: #1e1e1e; color: #ddd; }
+  #sidebar { width: 200px; overflow-y: auto; border-right: 1px solid #444; padding: 8px; box-sizing: border-box; }
+  #sidebar h2 { font-size: 13px; text-transform: uppercase; color: #888; margin: 4px 0 8px; }
+  #sidebar ul { list-style: none; margin: 0; padding: 0; }
+  #sidebar li { padding: 6px 8px; cursor: pointer; border-radius: 4px; }
+  #sidebar li:hover, #sidebar li.active { background: #333; }
+  #main { flex: 1; display: flex; flex-direction: column; padding: 12px; box-sizing: border-box; overflow: hidden; }
+  #sqlBox { display: flex; gap: 8px; margin-bottom: 8px; }
+  textarea { flex: 1; height: 60px; background: #111; color: #ddd; border: 1px solid #444; padding: 6px; font-family: monospace; }
+  button { padding: 0 16px; background: #2d6cdf; color: #fff; border: none; border-radius: 4px; cursor: pointer; }
+  #status { color: #f77; margin-bottom: 8px; white-space: pre-wrap; }
+  #resultWrap { flex: 1; overflow: auto; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 1px solid #444; padding: 4px 8px; text-align: left; white-space: nowrap; }
+  th { background: #2a2a2a; position: sticky; top: 0; }
+  #pager { margin-top: 8px; display: flex; gap: 8px; align-items: center; }
+</style>
+</head>
+<body>
+  <div id="sidebar">
+    <h2>Tables</h2>
+    <ul id="tableList"></ul>
+  </div>
+  <div id="main">
+    <div id="sqlBox">
+      <textarea id="sql" placeholder="SELECT * FROM measurement LIMIT 10"></textarea>
+      <button id="run">Run</button>
+    </div>
+    <div id="status"></div>
+    <div id="resultWrap"><table id="result"></table></div>
+    <div id="pager"></div>
+  </div>
+
+<script>
+let currentTable = null
+let offset = 0
+const LIMIT = 100
+
+async function loadTables() {
+  const tables = await fetch('/api/tables').then(r => r.json())
+  const list = document.getElementById('tableList')
+  list.innerHTML = ''
+  tables.forEach(name => {
+    const li = document.createElement('li')
+    li.textContent = name
+    li.onclick = () => openTable(name)
+    list.appendChild(li)
+  })
+}
+
+function renderRows(rows) {
+  const table = document.getElementById('result')
+  table.innerHTML = ''
+  if (!rows.length) {
+    table.innerHTML = '<tr><td>(no rows)</td></tr>'
+    return
+  }
+  const cols = Object.keys(rows[0])
+  const thead = document.createElement('tr')
+  cols.forEach(c => {
+    const th = document.createElement('th')
+    th.textContent = c
+    thead.appendChild(th)
+  })
+  table.appendChild(thead)
+  rows.forEach(row => {
+    const tr = document.createElement('tr')
+    cols.forEach(c => {
+      const td = document.createElement('td')
+      td.textContent = row[c]
+      tr.appendChild(td)
+    })
+    table.appendChild(tr)
+  })
+}
+
+async function openTable(name, newOffset = 0) {
+  currentTable = name
+  offset = newOffset
+  document.querySelectorAll('#tableList li').forEach(li => {
+    li.classList.toggle('active', li.textContent === name)
+  })
+  document.getElementById('status').textContent = ''
+  const res = await fetch(`/api/tables/${name}/rows?limit=${LIMIT}&offset=${offset}`).then(r => r.json())
+  if (res.error) {
+    document.getElementById('status').textContent = res.error
+    return
+  }
+  renderRows(res.rows)
+  const pager = document.getElementById('pager')
+  pager.innerHTML = ''
+  const info = document.createElement('span')
+  info.textContent = `${offset + 1}-${offset + res.rows.length} of ${res.total}`
+  pager.appendChild(info)
+  if (offset > 0) {
+    const prev = document.createElement('button')
+    prev.textContent = 'Prev'
+    prev.onclick = () => openTable(name, Math.max(0, offset - LIMIT))
+    pager.appendChild(prev)
+  }
+  if (offset + res.rows.length < res.total) {
+    const next = document.createElement('button')
+    next.textContent = 'Next'
+    next.onclick = () => openTable(name, offset + LIMIT)
+    pager.appendChild(next)
+  }
+}
+
+async function runQuery() {
+  const sql = document.getElementById('sql').value.trim()
+  if (!sql) return
+  document.getElementById('status').textContent = ''
+  document.getElementById('pager').innerHTML = ''
+  const res = await fetch('/api/query', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sql }),
+  }).then(r => r.json())
+  if (res.error) {
+    document.getElementById('status').textContent = res.error
+    document.getElementById('result').innerHTML = ''
+    return
+  }
+  if (res.rows) {
+    renderRows(res.rows)
+  } else {
+    document.getElementById('status').textContent = `OK: ${res.changes} row(s) changed`
+    document.getElementById('result').innerHTML = ''
+  }
+}
+document.getElementById('run').onclick = runQuery
+document.getElementById('sql').addEventListener('keydown', (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+    e.preventDefault()
+    runQuery()
+  }
+})
+
+loadTables()
+</script>
+</body>
+</html>
