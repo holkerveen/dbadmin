@@ -192,7 +192,12 @@ jobs:
             --format '{{json .Manifest}}' | jq -r .digest)
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
+      # Release tags only. GHCR has no OCI referrers API, so a pushed
+      # attestation lands as a `sha256-<subject-digest>` tag -- attesting every
+      # main commit would add one of those per push. Step-level `if`, so no job
+      # is skipped and nothing cascades.
       - name: Attest provenance
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/attest-build-provenance@v2
         with:
           subject-name: ${{ env.REGISTRY_IMAGE }}
