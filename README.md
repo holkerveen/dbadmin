@@ -33,7 +33,7 @@ Released images live at `ghcr.io/holkerveen/dbadmin`, built for `linux/amd64` an
 # in another project's docker-compose.yml
 services:
   dbadmin:
-    image: ghcr.io/holkerveen/dbadmin:1
+    image: ghcr.io/holkerveen/dbadmin:0.1
     environment:
       POSTGRES_HOST: db
       POSTGRES_PORT: 5432
@@ -49,14 +49,17 @@ services:
 
 | Tag | Meaning | Pin for |
 |---|---|---|
-| `1.2.3` | An exact release | Reproducible deploys |
-| `1.2` | Newest patch of 1.2 | Patch updates only |
-| `1` | Newest 1.x release | **Recommended default** |
+| `0.1.0` | An exact release | Reproducible deploys |
+| `0.1` | Newest patch of 0.1 | **Recommended while pre-1.0** |
+| `0` | Newest 0.x release | Nothing — see below |
 | `latest` | Newest release of any major | Casual/local use |
 | `edge` | Newest `main` commit | Nothing — no stability promise |
 | `sha-abc1234` | One specific commit | Debugging a regression |
 
-`latest` tracks releases, not `main`, so it will never hand you untested code — but it *will* cross major versions. For anything long-lived, pin `:1` or a `@sha256:` digest.
+`latest` tracks releases, not `main`, so it will never hand you untested code — but it *will* cross major versions.
+
+> [!CAUTION]
+> **While this project is pre-1.0, do not pin the major tag `:0`.** Semver treats `0.x` as initial development, where any minor bump may break compatibility — so `:0` can move from `0.1.x` to `0.2.0` and change behaviour under you. Pin `:0.1` or a `@sha256:` digest instead. Once `1.0.0` ships, `:1` becomes the sensible default and this caveat goes away.
 
 ## Environment variables
 
@@ -135,6 +138,10 @@ git push origin v1.2.3
 > Trade-off worth knowing: plain `npm version` cannot produce a tag/`package.json` mismatch, since it writes both atomically. The two-step flow can — that is precisely what the `assert-version` CI job is there to catch.
 
 Each platform builds natively (`ubuntu-latest` and `ubuntu-24.04-arm`) rather than under QEMU, and the two are merged into one manifest list. The arm64 runners are free only while this repository is public.
+
+## License
+
+[Apache-2.0](LICENSE). Use it, modify it, ship it commercially — just keep the copyright notice, and if you redistribute modified files, say that you changed them.
 
 ## Troubleshooting
 
