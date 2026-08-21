@@ -95,6 +95,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Only the labels are used here -- tags come from the merge job, since
+      # these builds push by digest. Without org.opencontainers.image.source
+      # the GHCR package is never linked to this repo and no Packages link
+      # appears in the repo sidebar.
+      - name: Docker meta (labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
+
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@v6
@@ -102,6 +112,7 @@ jobs:
           context: .
           target: prod
           platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
           # Attestation is done once against the merged manifest instead;
           # inline provenance adds manifest entries that confuse imagetools create.
           provenance: false
@@ -127,6 +138,8 @@ jobs:
   merge:
     needs: build
     runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.inspect.outputs.digest }}
     steps:
       - name: Download digests
         uses: actions/download-artifact@v4
@@ -161,7 +174,12 @@ jobs:
       - name: Create manifest list and push
         working-directory: ${{ runner.temp }}/digests
         run: |
-          docker buildx imagetools create \
+          # Array form keeps annotation values with spaces (descriptions, dates) intact.
+          annotations=()
+          while IFS= read -r a; do
+            [ -n "$a" ] && annotations+=(--annotation "index:$a")
+          done <<< "$DOCKER_METADATA_OUTPUT_ANNOTATIONS"
+          docker buildx imagetools create "${annotations[@]}" \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.REGISTRY_IMAGE }}@sha256:%s ' *)
 
@@ -180,3 +198,33 @@ jobs:
           subject-name: ${{ env.REGISTRY_IMAGE }}
           subject-digest: ${{ steps.inspect.outputs.digest }}
           push-to-registry: true
+
+  # Creates the GitHub Release entry (changelog page, source tarballs, watcher
+  # notification). Runs only after `merge`, so a Release never exists for a tag
+  # whose image failed to publish.
+  release:
+    needs: merge
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          body: |
+            ## Container image
+
+            ```sh
+            docker pull ${{ env.REGISTRY_IMAGE }}:${{ github.ref_name }}
+            ```
+
+            Multi-arch (`linux/amd64`, `linux/arm64`), digest `${{ needs.merge.outputs.digest }}`.
+
+            Pin `${{ env.REGISTRY_IMAGE }}@${{ needs.merge.outputs.digest }}` for an immutable reference.
