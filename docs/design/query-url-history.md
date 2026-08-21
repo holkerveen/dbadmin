@@ -1,4 +1,4 @@
-Status: Phase 2 — roast complete, questions open
+Status: Phase 3 — design agreed, awaiting review gate
 
 ## Brief
 
@@ -41,131 +41,140 @@ I think you should be able to setup a delegated event handler triggering on any 
 
 ## Design
 
-**The URL is the single source of truth for main-area state.** `?q=<url-encoded SQL>` fully determines what the main area shows. No query param → empty state (no table selected, empty result).
+**The URL is the source of truth for the main area, and it holds only read-only SQL.** `?q=<url-encoded SQL>` fully determines what is shown. No `q` → empty state.
 
-Flow:
+### Execution model
 
-1. **`navigate(query, {replace})`** — the one mutator. Writes `history.pushState({q}, '', '/?q=' + encodeURIComponent(query))` (or `replaceState`), then calls `render(query)`.
-2. **`render(query)`** — executes the query against the backend, paints `#result`, `#status`, `#pager`, sets the `#sql` placeholder to the current query, and re-derives the sidebar highlight. Never touches history. This makes `popstate` and `pushState` paths share one code path.
-3. **Delegated click handler** on `document`: `document.addEventListener('click', e => { const el = e.target.closest('[data-query]'); if (!el) return; e.preventDefault(); navigate(el.dataset.query) })`. Every navigable affordance — sidebar `li`, pager buttons, FK cells — is rendered carrying `data-query`, and none of them keeps its own `onclick` closure.
-4. **`popstate`** → `render(location.search q)` without pushing.
-5. **Initial load** → `render()` from `location.search`, so a bookmarked/deep-linked URL restores exactly.
-6. **Run button / Ctrl+Enter** → `navigate(textarea value)` rather than fetching directly, so manually run queries also land in history and become bookmarkable.
+`POST /api/query` takes `{ sql, readOnly }`. When `readOnly` is true the server runs the statement inside a `BEGIN READ ONLY` transaction on a checked-out client, so **PostgreSQL** rejects writes — no client-side regex guesses at what "read-only" means, and multi-statement payloads like `drop table pets; drop table users` are rejected wholesale. Anything arriving from the URL is executed with `readOnly: true`. Only the Run button sends `readOnly: false`.
 
-**Sidebar highlight** is derived from the current query by a `tableOfQuery(sql)` parse: match `/\bfrom\s+"?([a-z_][a-z0-9_$]*)"?/i` on the query, highlight the matching `li` if one exists, else clear all highlights. Deliberately a heuristic — it only drives a CSS class, so a miss is cosmetic.
+Consequently a write is never bookmarkable and never lands in history, which is exactly what makes Back safe. Run-button flow:
 
-**Pagination.** The pager is rebuilt from the current query by rewriting its `LIMIT`/`OFFSET` clause: `withPage(sql, limit, offset)` strips any trailing `LIMIT n [OFFSET n]` and appends the new one. Prev/Next are rendered as `data-query` carriers, so paging is ordinary navigation. Note: the brief's `limit 100, 100` is MySQL syntax; PostgreSQL requires `LIMIT 100 OFFSET 100` — see Open questions.
+1. POST `{sql, readOnly: false}`.
+2. If the response has `rows` (it was a SELECT), push the URL and paint.
+3. If it has `changes`, paint `OK: N row(s) changed` and **leave the URL untouched** — the address bar keeps showing the last read-only query.
 
-**Foreign keys.** A new endpoint exposes FK metadata; the frontend loads it once at startup alongside `/api/tables` and keeps a map `{ table: { column: { refTable, refColumn } } }`. `renderRows` needs to know which table the rows came from — it takes the `tableOfQuery` result. For each cell whose `(table, column)` is in the FK map and whose value is non-null, render an `<a>` (or `<span class="fk">`) carrying `data-query="select * from <refTable> where <refColumn> = <value>"` instead of plain text. The delegated handler does the rest.
+The server also sends `X-Frame-Options: DENY` so the drive-by-iframe path is closed even for read-only SQL.
 
-**Execution path.** Everything goes through `POST /api/query` so one code path serves both typed and generated queries — which means the `total` count that the pager prints today is no longer free. See Open questions.
+### Navigation
+
+- **`navigate(query)`** — the one mutator. `pushState({q}, '', '/?q=' + encodeURIComponent(query))`, then `render(query)`. Skips the push when `query === currentQuery()`, so double-clicking a sidebar item doesn't make Back a no-op.
+- **`render(query)`** — executes read-only, paints `#result`/`#status`/`#pager`, sets the `#sql` placeholder, clears the `#sql` value, re-derives the sidebar highlight. Never writes history, so `popstate` and `pushState` share one path.
+- **Ordering guard** — `render` increments a module-level `renderSeq` and captures it; after `await`, it returns without painting if `renderSeq` has moved on. Fixes the verified race where clicking `orders` then `categories` paints orders' rows under categories' URL.
+- **`popstate`** → `render(currentQuery())`, no push.
+- **Initial load** → `await` the table list, then `render(currentQuery())`.
+- **Empty/whitespace `q`** → empty state: no fetch, empty `#result`, empty `#pager`, no highlight. Never POSTs `'   '` (which would return EmptyQueryResponse and print `OK: null row(s) changed`).
+
+### Links
+
+Every navigable affordance is a real `<a href="/?q=<encoded>">`. One delegated handler:
+
+```js
+document.addEventListener('click', (e) => {
+  const a = e.target.closest('a[href^="/?q="]')
+  if (!a || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
+  e.preventDefault()
+  navigate(new URL(a.href).searchParams.get('q') ?? '')
+})
+```
+
+Modifier and non-primary clicks fall through to the browser, so ctrl/cmd-click and middle-click open a new tab, hover shows the target, and right-click → Copy Link Address works. Sidebar items stay `#tableList li` (the `active` class stays on the `li`) with an `<a>` inside; pager Prev/Next become `<a>` styled as buttons.
+
+### Sidebar highlight
+
+Derived from the current query by `tableOfQuery(sql)` — a regex on the FROM clause. **Purely cosmetic now**: FK rendering no longer depends on it (see below), so a miss only means no row is highlighted.
+
+### Pagination
+
+The pager renders **only for queries matching the shape this app generates**: `select * from <table> [where <col> = <literal>] limit <n> offset <m>`, matched by `parseGenerated(sql)`. Hand-typed SQL is executed byte-for-byte and gets no pager — so none of the verified rewrite corruptions (trailing semicolon, a user's own `limit 10`, a trailing `--` comment, `UPDATE ... LIMIT`, an inner subquery LIMIT) can occur, because the only SQL ever rewritten is SQL we built.
+
+Next-page detection uses **limit+1**: the client requests `limit <n+1>` while the URL says `limit <n>`, displays at most `n` rows, and renders Next only if `n+1` came back. No `COUNT(*)`, and no phantom page on tables whose row count is a multiple of the limit. The pager prints `1-100` with no `of N` — the total is deliberately gone.
+
+Prev/Next are ordinary `<a href>` links carrying the same query with a rewritten offset.
+
+### Foreign keys
+
+FK metadata is resolved **server-side, per result set**, from the field provenance node-postgres already returns: `result.fields[i].tableID` (pg_class OID) and `.columnID` (attnum) — verified at `node_modules/pg-protocol/dist/parser.js:211-217`. The server maps those pairs through `pg_constraint` (`contype = 'f'`, single-column `conkey`) to the referenced table/column and returns an `fks` map alongside `rows`. This works through aliases, joins and CTEs, which the FROM-regex could not: `select o.user_id as pet_id from orders o` correctly yields **no** FK link, instead of a wrong one.
+
+`pg_constraint` is used rather than the `table_constraints ⋈ key_column_usage ⋈ constraint_column_usage` join, which produces a cartesian product for composite FKs. Composite FKs are skipped (`array_length(conkey,1) = 1`).
+
+Link SQL is built with type-aware literal quoting, using `dataTypeID` from the same field metadata: numeric types inline bare, everything else is single-quoted with `''` doubling. NULL cells render as plain text, never links. That closes the verified second-order injection where a stored value `x'; drop table users; --` would otherwise become two executable statements.
+
+### Resource bounds
+
+`src/db.js` sets `statement_timeout` (30s) on the pool — a supported pg config key, verified at `node_modules/pg/lib/connection-parameters.js:121`. `/api/query` caps returned rows at `MAX_ROWS = 1000` and sets `truncated: true`; the UI shows a notice. This restores the protection `GET /api/tables/:name/rows` gives today and which the unified path would otherwise drop.
+
+`GET /api/tables/:name/rows` is **deleted** — it has no caller once navigation unifies on `/api/query`. `GET /api/tables/:name/columns` stays.
 
 ## Interfaces
 
-Frontend (inline module in `src/public/index.html`):
+Backend — `src/index.js`:
+
+```
+POST /api/query   { sql: string, readOnly?: boolean }
+  SELECT  -> { rows: object[], fks: Record<colName, {table: string, column: string, quote: boolean}>, truncated: boolean }
+  other   -> { changes: number|null }
+  error   -> 400 { error: string }
+```
+`readOnly: true` wraps execution in `BEGIN READ ONLY` / `COMMIT` on a checked-out client. `fks` is keyed by the **output column name** as it appears in `rows`, so the client needs no table context. `quote` says whether a value must be single-quoted into the generated SQL.
+
+Deleted: `GET /api/tables/:name/rows`.
+
+Frontend — inline module in `src/public/index.html`:
 
 ```js
-/** @returns {string} the q param, or '' */
-function currentQuery()
-/** Push (or replace) history and re-render. */
-function navigate(query, opts?: { replace?: boolean }): void
-/** Execute + paint from a query string. No history writes. */
-async function render(query: string): Promise<void>
-/** @returns {string|null} table name heuristically parsed from a FROM clause */
-function tableOfQuery(sql)
-/** @returns {{limit: number|null, offset: number}} parsed trailing pagination */
-function pageOfQuery(sql)
-/** @returns {string} sql with its LIMIT/OFFSET replaced */
-function withPage(sql, limit, offset)
-/** @param rows, @param table used for FK lookup (may be null) */
-function renderRows(rows, table)
+function currentQuery()                      // -> string, the q param or ''
+function navigate(query)                     // push (unless unchanged) + render
+async function render(query)                 // execute + paint; no history writes
+function tableOfQuery(sql)                   // -> string|null; cosmetic highlight only
+function parseGenerated(sql)                 // -> {table, where, limit, offset}|null
+function buildGenerated({table, where, limit, offset})  // -> string
+function queryHref(sql)                      // -> '/?q=' + encodeURIComponent(sql)
+function sqlLiteral(value, quote)            // -> SQL literal, '' doubled
+function renderRows(rows, fks)               // fks keyed by output column name
 ```
 
-Backend, new endpoint (exact shape TBD in Phase 3):
-
-```
-GET /api/foreign-keys
--> [{ table_name, column_name, foreign_table_name, foreign_column_name }, ...]
-```
-sourced from `information_schema.table_constraints` ⋈ `key_column_usage` ⋈ `constraint_column_usage`, filtered to `constraint_type = 'FOREIGN KEY'` and `table_schema = 'public'`.
-
-DOM contract (what e2e specs and helpers may rely on):
-- `#sql`, `#run`, `#status`, `#result`, `#pager`, `#tableList` — unchanged ids.
-- Any navigable element carries `data-query="<sql>"`.
-- Sidebar item: `#tableList li[data-query]`, active one has class `active`.
-- Pager buttons: `#pager button[data-query]` labelled `Prev` / `Next`.
-- FK cell link: `#result td a[data-query]`.
+DOM contract (what specs and helpers may rely on):
+- ids unchanged: `#sql`, `#run`, `#status`, `#result`, `#pager`, `#tableList`.
+- every navigable element is `a[href^="/?q="]`.
+- sidebar: `#tableList li` (active one has class `active`) containing an `<a>`.
+- pager: `#pager a` with text `Prev` / `Next`.
+- FK cell: `#result td a`.
 
 ## Work breakdown
 
-1. **Backend FK endpoint** — `src/index.js`. Depends on: nothing.
-2. **URL/history core** — `navigate`, `render`, `popstate`, delegated click handler, placeholder, initial load. `src/public/index.html`. Depends on: nothing (skeleton fixes the seams).
-3. **Sidebar + pagination as data-query** — `tableOfQuery`, `pageOfQuery`, `withPage`, pager rebuild. `src/public/index.html`. Depends on: 2.
-4. **FK link rendering** — `renderRows` FK map lookup + link emission. `src/public/index.html`. Depends on: 1, 2.
-5. **Update existing specs + helpers** to the new navigation model — `tests/e2e/helpers/api.js`, `tests/e2e/specs/*.spec.js`. Depends on: 2, 3, 4.
-6. **New e2e spec** for URL/history/FK acceptance — `tests/e2e/specs/query-url.spec.js`. Depends on: 5.
-7. **README** update of the Architecture section. Depends on: 1.
+Merged down from seven parts — parts 2-4 all owned `src/public/index.html`, so splitting them bought handoffs and no parallelism.
 
-Parts 2, 3, 4 all own `src/public/index.html` → they cannot be parallel. Serialize or merge into one agent.
+1. **Backend** — `src/index.js`, `src/db.js`. Read-only transaction path, FK provenance via `pg_constraint`, row cap + `truncated`, `statement_timeout`, `X-Frame-Options`, delete `GET /api/tables/:name/rows`. Depends on: nothing.
+2. **Frontend** — `src/public/index.html`, whole inline script. URL/history/delegated handler/pager/FK links/placeholder/render guard. Depends on: 1's response shape (fixed by the skeleton).
+3. **Tests + docs** — `tests/e2e/helpers/api.js`, `tests/e2e/specs/*.spec.js`, new `tests/e2e/specs/query-url.spec.js`, `README.md`. Depends on: 1, 2.
 
 ## E2E acceptance
 
-1. **Bookmark + back/forward.** Clicking `pets` in the sidebar puts `?q=select%20*%20from%20pets...` in the address bar without a full page load, shows pet rows, and highlights `pets`. Clicking `Next` changes the URL's offset. Pressing Back returns to page 1 — URL, rows, and highlight all restored. Loading the deep URL cold in a fresh tab shows the same page-2 state.
-2. **Foreign-key click-through.** With `pets` open, a `category_id` cell is a link; clicking it navigates to `?q=select * from categories where id = <that value>` and the result table shows exactly that one category row, with `categories` now highlighted in the sidebar.
+1. **Bookmark + back/forward.** Clicking `pets` in the sidebar puts `?q=select%20*%20from%20pets...` in the address bar with no page load, shows pet rows, highlights `pets`. Next changes the offset in the URL. Back restores page 1 — URL, rows and highlight. Loading the page-2 URL cold shows the same state.
+2. **Foreign-key click-through.** With `pets` open, a `category_id` cell is a link; clicking it navigates to `?q=select * from categories where id = <value> limit 100 offset 0`, the result shows that one category, and `categories` is highlighted.
 
 ## Open questions
 
-Each survived verification against the actual code. Findings that didn't are dropped.
-
-**Q1 — Does a URL execute non-SELECT SQL? (security model; verified)**
-Today, opening any URL runs zero user SQL: `src/public/index.html:146` only calls `loadTables()`. Cross-origin JS cannot reach `POST /api/query` — there is no CORS middleware in `src/index.js` (verified: no `cors`/`helmet` import), so a cross-origin `fetch` with `Content-Type: application/json` is preflighted and the server never answers the preflight. The loopback-binding advice in `README.md` genuinely holds today.
-After this design, step 5 makes initial load execute `location.search`'s `q`. A hidden `<iframe src="http://localhost:8080/?q=drop table pets cascade">` on any page the operator visits then executes DDL same-origin, no click. Verified amplifier: `pool.query(sql)` with no values uses the simple query protocol, which permits multiple statements — `node_modules/pg/lib/query.js:65-69` collects them into an array — so one URL carries `?q=drop table pets; drop table users`.
-Same root cause, second symptom: `popstate` re-executes. Run an `INSERT`, click a table, press Back → the INSERT runs again. F5, tab-restore, and omnibox prerender do the same.
-Options: (a) URL-driven execution restricted to statements the *server* classifies as read-only, non-SELECT only ever via the Run button and never pushed to the URL; (b) execute anything from the URL but require a confirm click for non-SELECT; (c) accept it as consistent with the existing "this is an open SQL console" posture.
-
-**Q2 — Where does the pager's `of N` total come from?**
-`POST /api/query` returns `{rows}` only (`src/index.js:75`). The `1-100 of 400` readout comes from `/api/tables/:name/rows`'s separate `COUNT(*)` (`src/index.js:64-65`), which the unified path removes. `tests/e2e/specs/rows.spec.js` asserts those literal strings.
-Without a total, "is there a next page?" is unknowable: on `pets` (`PET_COUNT = 400`) page 4 returns exactly 100 rows, so a naive `rows.length === limit` test renders Next, and clicking it shows `(no rows)` — a phantom page on every table whose count is a multiple of the limit.
-Options: (a) server wraps the SELECT as `SELECT COUNT(*) FROM (<sql>) _p` and returns `total`; (b) drop the total, pager becomes `Prev if offset>0` / `Next if rows.length === limit`, accepting the phantom page or fetching `limit+1` rows to detect it; (c) keep `/api/tables/:name/rows` for the plain-table case.
-
-**Q3 — How is a column identified as a foreign key? (regex vs. server-side provenance)**
-The design derives the table via a FROM-clause regex and looks up a client-side `{table:{column:...}}` map. Verified failure: `select o.user_id as pet_id, o.id from orders o` matches `orders`, whose FK map has `orders.pet_id → pets.id`, so a column *named* `pet_id` holding user ids renders a link to a wrong-but-plausible pet. `select * from public.pets` captures `public` and yields no links at all. A CTE captures the CTE's inner table.
-Verified alternative: node-postgres exposes `result.fields[i].tableID` (pg_class OID) and `.columnID` (attnum) for every result column — `node_modules/pg-protocol/dist/parser.js:211-217`. The server can resolve exactly which physical column each cell came from, aliases and joins included, and return `fks` alongside `rows`. That deletes `GET /api/foreign-keys`, the startup fetch, the client map, the `table` argument to `renderRows`, and `tableOfQuery`'s only non-cosmetic consumer.
-Consequence either way: the doc's claim that a `tableOfQuery` miss is "cosmetic" is false under the regex design, since the same value keys FK rendering.
-
-**Q4 — How are FK cell values escaped into the generated SQL?**
-The design concatenates cell text into `where <col> = <value>`. `pets.category_id` is nullable (`db/schema.sql:35`); a NULL yields `where id = null` → zero rows, indistinguishable from a deleted row. A text FK value `O'Brien` yields an unterminated literal. A stored value `x'; drop table users; --` yields two statements that the simple query protocol will happily run — meaning anyone who can *insert a row* into the host application's database can attack the admin who browses it, which is a strictly lower bar than needing network access to port 8080.
-
-**Q5 — Does the pager rewrite the user's SQL, and what does it do to SQL it doesn't understand?**
-Verified corruptions of "strip trailing `LIMIT n [OFFSET n]`, append new": `select * from pets;` → `select * from pets; LIMIT 100 OFFSET 0` (syntax error — a trailing semicolon is a universal psql habit); `select ... limit 10` → Next silently serves rows 101-200 of a query the user capped at 10; `select * from pets -- todo` → the appended clause lands inside the line comment; `UPDATE users SET ...` → `UPDATE ... LIMIT 100` is not valid Postgres; `... where id in (select id from categories limit 3)` → a loose regex rewrites the *inner* limit and silently changes the result set.
-Separately: generated queries carry no `ORDER BY`, and Postgres guarantees no row order across statements, so paging can skip and duplicate rows after any concurrent write. (This is already true of `/api/tables/:name/rows` today; the design promotes it to a bookmarkable artifact.)
-Options: (a) keep LIMIT in the SQL as the brief asks and accept these; (b) add `ORDER BY` to generated queries and only render the pager when the query is a bare generated `select * from <t>`; (c) move pagination to a separate URL param and wrap server-side.
-
-**Q6 — `data-query` attribute, or a real `<a href="/?q=...">`?**
-The handler cost is identical — `closest('a[href^="/?q="]')` plus modifier-key guards. With a real href the operator gets middle-click-to-new-tab, ctrl/cmd-click, hover URL preview, right-click → Copy Link Address, and native keyboard focus. With `data-query` on an `<a>` with no `href`, middle-click fires `auxclick` (not `click`), so nothing happens at all, `getByRole('link')` matches nothing, and Tab can't reach FK cells. The "degrades without JS" argument is void either way — `src/index.js:8-9` serves one static file and never renders `?q=` server-side.
-Also unguarded in the current design: the handler calls `preventDefault()` with no `e.button`/`ctrlKey`/`metaKey`/`shiftKey` check, so ctrl-click hijacks the current tab, and finishing a drag-select over a sidebar item navigates away.
-
-**Q7 — What bounds the result size?**
-`src/index.js:58` caps `limit` at 1000 and is today the only path a sidebar click takes. The brief's URL shape `?q=select * from tablename` has no LIMIT. Pointed at a 10M-row table, `pool.query` buffers every row into the Node heap (no cursor, no stream) and `res.json` serializes the lot → OOM; if the server survives, `renderRows` builds tens of millions of DOM nodes. `src/db.js:5-11` sets no `statement_timeout` and `Pool` defaults to `max: 10`, so a handful of such clicks exhausts the pool and `/healthz`'s `SELECT 1` blocks.
-
-**Q8 — The placeholder only renders while the textarea is empty.**
-The brief asks for the current query to show as the `#sql` placeholder. A placeholder is invisible once the field has content. Type `select 1`, Run — the textarea now permanently contains `select 1`, so every subsequent navigation updates a placeholder nobody can see, and the requirement silently stops holding. Clearing the textarea on navigate would destroy in-progress typing on every FK click.
-
-**Q9 — Concurrent `render()` calls paint out of order.**
-`render` is async with no generation token or `AbortController`. Click `orders` (600 rows) then `categories` (8 rows) within ~50 ms: `categories` paints first, then the `orders` response overwrites `#result` while the URL and sidebar highlight both say `categories`. Same for the cold-load `render('')` racing `loadTables()` and the FK fetch. In CI this makes `expect(page.locator('#result tr')).toHaveCount(101)` flaky, and `playwright.config.js` sets no `retries`, so one flake fails the pipeline.
-
-**Q10 — Minor, but decide now rather than during implementation.**
-(a) The `table_constraints ⋈ key_column_usage ⋈ constraint_column_usage` join is the classic broken FK query: for a 2-column FK it produces a cartesian product and maps column A to referenced column B. `pg_constraint` with `conkey`/`confkey` ordinality is correct. `pet_tags` (`db/schema.sql:42-46`) has a composite PK today.
-(b) `information_schema` filters to objects the current role has privileges on, so under a non-owner read-only login FK links silently never appear.
-(c) `navigate` pushes unconditionally, so clicking `pets` twice makes Back a visible no-op.
-(d) Empty/whitespace `q`: `pool.query('   ')` returns EmptyQueryResponse, so `result.command !== 'SELECT'` and the UI prints `OK: null row(s) changed` (`src/index.js:75-78`, `src/public/index.html:134`). The current `if (!sql) return` guard (`src/public/index.html:117`) has no equivalent in the new flow.
-(e) SQL in the URL leaks into reverse-proxy access logs, browser history, and browser account sync — a different exposure from the network-reachability one the README covers. Node caps the request line + headers at 16 KB by default, so a ~24 KB query works in-page via `pushState` but returns 431 on reload.
-(f) `GET /api/tables/:name/rows` becomes dead code, still documented in `README.md` as the row browser.
+None — all resolved below.
 
 ## Decisions
 
+1. **URL-sourced SQL executes read-only; writes never enter the URL.** → Server wraps URL-sourced execution in `BEGIN READ ONLY`, so Postgres enforces it. Run-button writes execute and report, leaving the address bar on the last read-only query. Closes the drive-by `<iframe src="...?q=drop table pets">` path and the Back-re-runs-my-INSERT path. Consequence: writes are not bookmarkable — accepted deliberately. `X-Frame-Options: DENY` added alongside, since a framed page could otherwise still be clickjacked.
+2. **No `COUNT(*)`; next-page detection by fetching limit+1.** → Pager loses `of N` and prints `1-100`. No phantom page. `tests/e2e/specs/rows.spec.js` count assertions must be rewritten to offset ranges.
+3. **FK metadata comes from server-side field provenance, not a FROM regex.** → `GET /api/foreign-keys`, the client-side FK map and `renderRows`'s `table` argument are all deleted before being written; `fks` rides on the `/api/query` response keyed by output column name. `tableOfQuery` survives only as the cosmetic sidebar highlight. FK links now work on joins and aliases.
+4. **Real `<a href="/?q=...">`, not `data-query`.** → Same delegated handler with modifier-key guards; middle-click, ctrl-click, hover preview and Copy Link Address all work. Departs from the brief's suggested `data-query` mechanism; the delegated-handler idea itself is kept exactly as briefed. DOM contract changes: pager Prev/Next are `#pager a`, not `button`.
+5. **The pager renders only for app-generated query shapes.** → Hand-typed SQL is never rewritten and never paged, which is what makes the verified corruptions (trailing `;`, a user's own `limit 10`, trailing `--`, `UPDATE ... LIMIT`, inner-subquery LIMIT) unreachable rather than defended against.
+6. **FK values are literal-quoted by type; NULL cells are not links.** → `sqlLiteral(value, quote)` doubles embedded `'`. Closes the stored-value injection (`x'; drop table users; --`) and stops `where id = null` masquerading as a deleted row.
+7. **Navigation clears the `#sql` textarea** so the current-query placeholder stays visible on every navigation, not just the first. Consequence: an unrun draft in the textarea is lost when you click an FK link. Accepted.
+8. **`statement_timeout` = 30s on the pool, and `/api/query` caps at 1000 rows with `truncated: true`.** → Restores the bound that deleting `GET /api/tables/:name/rows` would otherwise remove. A runaway `select * from events` fails with a Postgres timeout instead of OOM-killing the container.
+9. **`GET /api/tables/:name/rows` is deleted**, README Architecture updated. `GET /api/tables/:name/columns` stays even though the frontend doesn't call it.
+10. **Housekeeping settled without a round trip:** `navigate` skips the push when the query is unchanged; empty/whitespace `q` renders empty state without POSTing; `render` uses a sequence token so a slow response can't paint over a newer one.
+
 ## Risks
 
-- Existing specs and `helpers/api.js` are coupled to the `/api/tables/:name/rows` endpoint and to pager button `onclick`s. Part 5 is not optional cleanup; the suite goes red without it.
-- `POST /api/query` executes arbitrary SQL. Generating SQL by string-concatenating cell values into `where id = <value>` is injection-by-construction — benign here only because the console is already an unrestricted SQL endpoint, but non-integer/NULL/text FK values need quoting or the query is malformed.
-- The inline frontend script is neither linted nor typechecked (`jsconfig.json` includes only `src/**/*.js`), so frontend regressions are caught only by e2e.
+- **Generated queries carry no `ORDER BY`** (the offered variant was declined). Postgres guarantees no row order across statements, so paging can skip or duplicate a row after a concurrent write. This is already true of today's `/api/tables/:name/rows` browsing; the change makes those pages bookmarkable, which makes the inconsistency more visible.
+- **SQL now travels in the request line**, so it lands in reverse-proxy access logs, browser history, and browser account sync — a different exposure from the network-reachability one the README covers. Worth a README note. Node caps the request line + headers at 16 KB, so a ~24 KB query works in-page via `pushState` but returns 431 on reload.
+- **Bookmarks don't survive a rollback**: reverting to `:0.1.0` makes every saved `?q=` URL open a blank main area, since that version ignores `location.search`. This is a `0.2.0`, and the release note should lead with the URL-execution change.
+- **`pg_constraint` is read per SELECT.** Cheap (an OID-pair lookup, not the `information_schema` join), but it is an extra round trip on every navigation. Unlike `information_schema`, `pg_constraint` is not privilege-filtered, so FK links won't silently vanish under a non-owner read-only login.
+- **The inline frontend script is neither linted nor typechecked** (`jsconfig.json` covers only `src/**/*.js`), so frontend regressions are caught only by e2e.
+- **Existing specs and `tests/e2e/helpers/api.js` break by design.** `selectTable` waits on `/api/tables/:name/rows`, which will no longer exist — the failure mode is a 30s hang, not a fast failure. Part 3 is a gate, not cleanup.
