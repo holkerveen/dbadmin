@@ -1,4 +1,4 @@
-Status: Phase 1 — design doc
+Status: Phase 2 — roast complete, questions open
 
 ## Brief
 
@@ -115,7 +115,52 @@ Parts 2, 3, 4 all own `src/public/index.html` → they cannot be parallel. Seria
 
 ## Open questions
 
-(populated in Phase 2)
+Each survived verification against the actual code. Findings that didn't are dropped.
+
+**Q1 — Does a URL execute non-SELECT SQL? (security model; verified)**
+Today, opening any URL runs zero user SQL: `src/public/index.html:146` only calls `loadTables()`. Cross-origin JS cannot reach `POST /api/query` — there is no CORS middleware in `src/index.js` (verified: no `cors`/`helmet` import), so a cross-origin `fetch` with `Content-Type: application/json` is preflighted and the server never answers the preflight. The loopback-binding advice in `README.md` genuinely holds today.
+After this design, step 5 makes initial load execute `location.search`'s `q`. A hidden `<iframe src="http://localhost:8080/?q=drop table pets cascade">` on any page the operator visits then executes DDL same-origin, no click. Verified amplifier: `pool.query(sql)` with no values uses the simple query protocol, which permits multiple statements — `node_modules/pg/lib/query.js:65-69` collects them into an array — so one URL carries `?q=drop table pets; drop table users`.
+Same root cause, second symptom: `popstate` re-executes. Run an `INSERT`, click a table, press Back → the INSERT runs again. F5, tab-restore, and omnibox prerender do the same.
+Options: (a) URL-driven execution restricted to statements the *server* classifies as read-only, non-SELECT only ever via the Run button and never pushed to the URL; (b) execute anything from the URL but require a confirm click for non-SELECT; (c) accept it as consistent with the existing "this is an open SQL console" posture.
+
+**Q2 — Where does the pager's `of N` total come from?**
+`POST /api/query` returns `{rows}` only (`src/index.js:75`). The `1-100 of 400` readout comes from `/api/tables/:name/rows`'s separate `COUNT(*)` (`src/index.js:64-65`), which the unified path removes. `tests/e2e/specs/rows.spec.js` asserts those literal strings.
+Without a total, "is there a next page?" is unknowable: on `pets` (`PET_COUNT = 400`) page 4 returns exactly 100 rows, so a naive `rows.length === limit` test renders Next, and clicking it shows `(no rows)` — a phantom page on every table whose count is a multiple of the limit.
+Options: (a) server wraps the SELECT as `SELECT COUNT(*) FROM (<sql>) _p` and returns `total`; (b) drop the total, pager becomes `Prev if offset>0` / `Next if rows.length === limit`, accepting the phantom page or fetching `limit+1` rows to detect it; (c) keep `/api/tables/:name/rows` for the plain-table case.
+
+**Q3 — How is a column identified as a foreign key? (regex vs. server-side provenance)**
+The design derives the table via a FROM-clause regex and looks up a client-side `{table:{column:...}}` map. Verified failure: `select o.user_id as pet_id, o.id from orders o` matches `orders`, whose FK map has `orders.pet_id → pets.id`, so a column *named* `pet_id` holding user ids renders a link to a wrong-but-plausible pet. `select * from public.pets` captures `public` and yields no links at all. A CTE captures the CTE's inner table.
+Verified alternative: node-postgres exposes `result.fields[i].tableID` (pg_class OID) and `.columnID` (attnum) for every result column — `node_modules/pg-protocol/dist/parser.js:211-217`. The server can resolve exactly which physical column each cell came from, aliases and joins included, and return `fks` alongside `rows`. That deletes `GET /api/foreign-keys`, the startup fetch, the client map, the `table` argument to `renderRows`, and `tableOfQuery`'s only non-cosmetic consumer.
+Consequence either way: the doc's claim that a `tableOfQuery` miss is "cosmetic" is false under the regex design, since the same value keys FK rendering.
+
+**Q4 — How are FK cell values escaped into the generated SQL?**
+The design concatenates cell text into `where <col> = <value>`. `pets.category_id` is nullable (`db/schema.sql:35`); a NULL yields `where id = null` → zero rows, indistinguishable from a deleted row. A text FK value `O'Brien` yields an unterminated literal. A stored value `x'; drop table users; --` yields two statements that the simple query protocol will happily run — meaning anyone who can *insert a row* into the host application's database can attack the admin who browses it, which is a strictly lower bar than needing network access to port 8080.
+
+**Q5 — Does the pager rewrite the user's SQL, and what does it do to SQL it doesn't understand?**
+Verified corruptions of "strip trailing `LIMIT n [OFFSET n]`, append new": `select * from pets;` → `select * from pets; LIMIT 100 OFFSET 0` (syntax error — a trailing semicolon is a universal psql habit); `select ... limit 10` → Next silently serves rows 101-200 of a query the user capped at 10; `select * from pets -- todo` → the appended clause lands inside the line comment; `UPDATE users SET ...` → `UPDATE ... LIMIT 100` is not valid Postgres; `... where id in (select id from categories limit 3)` → a loose regex rewrites the *inner* limit and silently changes the result set.
+Separately: generated queries carry no `ORDER BY`, and Postgres guarantees no row order across statements, so paging can skip and duplicate rows after any concurrent write. (This is already true of `/api/tables/:name/rows` today; the design promotes it to a bookmarkable artifact.)
+Options: (a) keep LIMIT in the SQL as the brief asks and accept these; (b) add `ORDER BY` to generated queries and only render the pager when the query is a bare generated `select * from <t>`; (c) move pagination to a separate URL param and wrap server-side.
+
+**Q6 — `data-query` attribute, or a real `<a href="/?q=...">`?**
+The handler cost is identical — `closest('a[href^="/?q="]')` plus modifier-key guards. With a real href the operator gets middle-click-to-new-tab, ctrl/cmd-click, hover URL preview, right-click → Copy Link Address, and native keyboard focus. With `data-query` on an `<a>` with no `href`, middle-click fires `auxclick` (not `click`), so nothing happens at all, `getByRole('link')` matches nothing, and Tab can't reach FK cells. The "degrades without JS" argument is void either way — `src/index.js:8-9` serves one static file and never renders `?q=` server-side.
+Also unguarded in the current design: the handler calls `preventDefault()` with no `e.button`/`ctrlKey`/`metaKey`/`shiftKey` check, so ctrl-click hijacks the current tab, and finishing a drag-select over a sidebar item navigates away.
+
+**Q7 — What bounds the result size?**
+`src/index.js:58` caps `limit` at 1000 and is today the only path a sidebar click takes. The brief's URL shape `?q=select * from tablename` has no LIMIT. Pointed at a 10M-row table, `pool.query` buffers every row into the Node heap (no cursor, no stream) and `res.json` serializes the lot → OOM; if the server survives, `renderRows` builds tens of millions of DOM nodes. `src/db.js:5-11` sets no `statement_timeout` and `Pool` defaults to `max: 10`, so a handful of such clicks exhausts the pool and `/healthz`'s `SELECT 1` blocks.
+
+**Q8 — The placeholder only renders while the textarea is empty.**
+The brief asks for the current query to show as the `#sql` placeholder. A placeholder is invisible once the field has content. Type `select 1`, Run — the textarea now permanently contains `select 1`, so every subsequent navigation updates a placeholder nobody can see, and the requirement silently stops holding. Clearing the textarea on navigate would destroy in-progress typing on every FK click.
+
+**Q9 — Concurrent `render()` calls paint out of order.**
+`render` is async with no generation token or `AbortController`. Click `orders` (600 rows) then `categories` (8 rows) within ~50 ms: `categories` paints first, then the `orders` response overwrites `#result` while the URL and sidebar highlight both say `categories`. Same for the cold-load `render('')` racing `loadTables()` and the FK fetch. In CI this makes `expect(page.locator('#result tr')).toHaveCount(101)` flaky, and `playwright.config.js` sets no `retries`, so one flake fails the pipeline.
+
+**Q10 — Minor, but decide now rather than during implementation.**
+(a) The `table_constraints ⋈ key_column_usage ⋈ constraint_column_usage` join is the classic broken FK query: for a 2-column FK it produces a cartesian product and maps column A to referenced column B. `pg_constraint` with `conkey`/`confkey` ordinality is correct. `pet_tags` (`db/schema.sql:42-46`) has a composite PK today.
+(b) `information_schema` filters to objects the current role has privileges on, so under a non-owner read-only login FK links silently never appear.
+(c) `navigate` pushes unconditionally, so clicking `pets` twice makes Back a visible no-op.
+(d) Empty/whitespace `q`: `pool.query('   ')` returns EmptyQueryResponse, so `result.command !== 'SELECT'` and the UI prints `OK: null row(s) changed` (`src/index.js:75-78`, `src/public/index.html:134`). The current `if (!sql) return` guard (`src/public/index.html:117`) has no equivalent in the new flow.
+(e) SQL in the URL leaks into reverse-proxy access logs, browser history, and browser account sync — a different exposure from the network-reachability one the README covers. Node caps the request line + headers at 16 KB by default, so a ~24 KB query works in-page via `pushState` but returns 431 on reload.
+(f) `GET /api/tables/:name/rows` becomes dead code, still documented in `README.md` as the row browser.
 
 ## Decisions
 
