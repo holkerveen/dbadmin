@@ -3,3 +3,4 @@ test-results/
 playwright-report/
 trace-archive/
 .env
+.zed/

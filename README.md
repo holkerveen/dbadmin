@@ -2,6 +2,11 @@
 
 A small web-based PostgreSQL admin client: browse tables, inspect columns, page through rows, and run raw SQL — all from one page, no ORM.
 
+> [!WARNING]
+> **dbadmin has no authentication.** `POST /api/query` executes arbitrary SQL, and the server binds `0.0.0.0`. Anything that can reach the container has full control of the database — read, write, drop.
+>
+> Publish it only to loopback or an internal-only Docker network, never to a public interface or an ingress. Treat the port as equivalent to handing out your Postgres superuser password.
+
 ## Prerequisites
 
 - Docker Engine with the Compose v2 plugin (`docker compose ...`, not the legacy `docker-compose` binary)
@@ -19,6 +24,39 @@ Node is required even though the app runs in containers: the database schema/see
 ```
 
 Open http://localhost:8080.
+
+## Using the published image
+
+Released images live at `ghcr.io/holkerveen/dbadmin`, built for `linux/amd64` and `linux/arm64`. The image is the viewer only — no schema, seeder, tests, or `dbadmin.sh` — so point it at a database you already have.
+
+```yaml
+# in another project's docker-compose.yml
+services:
+  dbadmin:
+    image: ghcr.io/holkerveen/dbadmin:1
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: myapp
+      DB_ADMIN_PORT: 80
+    ports:
+      - '127.0.0.1:8080:80'   # loopback only -- see the warning above
+```
+
+### Tags
+
+| Tag | Meaning | Pin for |
+|---|---|---|
+| `1.2.3` | An exact release | Reproducible deploys |
+| `1.2` | Newest patch of 1.2 | Patch updates only |
+| `1` | Newest 1.x release | **Recommended default** |
+| `latest` | Newest release of any major | Casual/local use |
+| `edge` | Newest `main` commit | Nothing — no stability promise |
+| `sha-abc1234` | One specific commit | Debugging a regression |
+
+`latest` tracks releases, not `main`, so it will never hand you untested code — but it *will* cross major versions. For anything long-lived, pin `:1` or a `@sha256:` digest.
 
 ## Environment variables
 
@@ -73,6 +111,25 @@ Specs cover the app's main surface: the table sidebar and column introspection, 
 ./dbadmin.sh lint        # eslint .
 ./dbadmin.sh typecheck   # tsc -p jsconfig.json (checkJs against JSDoc types)
 ```
+
+## Releasing
+
+CI (`.github/workflows/ci.yml`) runs lint, typecheck, and the full e2e suite on every push and PR. Nothing reaches the registry unless that passes.
+
+- Push to `main` → publishes `edge` and `sha-<short>`.
+- Push a `vX.Y.Z` tag → publishes the semver tags and moves `latest`.
+
+To cut a release, bump `package.json` first — a dedicated CI job fails the run if the tag and `package.json` version disagree:
+
+```sh
+npm version 1.2.3 --no-git-tag-version
+git commit -am 'Release 1.2.3'
+git push
+git tag v1.2.3
+git push origin v1.2.3
+```
+
+Each platform builds natively (`ubuntu-latest` and `ubuntu-24.04-arm`) rather than under QEMU, and the two are merged into one manifest list. The arm64 runners are free only while this repository is public.
 
 ## Troubleshooting
 

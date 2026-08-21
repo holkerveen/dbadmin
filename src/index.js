@@ -83,6 +83,22 @@ app.post('/api/query', async (req, res) => {
 })
 
 const port = Number(process.env.DB_ADMIN_PORT ?? 80)
-app.listen(port, '0.0.0.0', () => {
+const server = app.listen(port, '0.0.0.0', () => {
   console.log(`DB admin listening on http://0.0.0.0:${port}`)
 })
+
+/** @param {NodeJS.Signals} signal */
+async function shutdown(signal) {
+  console.log(`${signal} received, shutting down`)
+  server.close()
+  await pool.end()
+}
+
+for (const signal of /** @type {const} */ (['SIGTERM', 'SIGINT'])) {
+  process.once(signal, () => {
+    shutdown(signal).catch((err) => {
+      console.error(err)
+      process.exit(1)
+    })
+  })
+}

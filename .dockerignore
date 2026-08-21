@@ -1,6 +1,10 @@
 node_modules
 .git
+.github
 tests
+test-results
+playwright-report
+trace-archive
 db
 *.md
 .env
