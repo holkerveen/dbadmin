@@ -134,6 +134,8 @@ Specs cover the app's main surface: the table sidebar and column introspection, 
 
 CI (`.github/workflows/ci.yml`) runs lint, typecheck, and the full e2e suite on every push and PR. Nothing reaches the registry unless that passes.
 
+For the step-by-step checklist, see [`docs/releasing.md`](docs/releasing.md).
+
 - Push to `main` → publishes `edge` and `sha-<short>`.
 - Push a `vX.Y.Z` tag → publishes the semver tags and moves `latest`.
 
