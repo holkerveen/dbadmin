@@ -1,4 +1,4 @@
-Status: Phase 3 — design agreed, awaiting review gate
+Status: Complete — implemented, e2e green on dev and prod stacks
 
 ## Brief
 
@@ -176,5 +176,6 @@ None — all resolved below.
 - **SQL now travels in the request line**, so it lands in reverse-proxy access logs, browser history, and browser account sync — a different exposure from the network-reachability one the README covers. Worth a README note. Node caps the request line + headers at 16 KB, so a ~24 KB query works in-page via `pushState` but returns 431 on reload.
 - **Bookmarks don't survive a rollback**: reverting to `:0.1.0` makes every saved `?q=` URL open a blank main area, since that version ignores `location.search`. This is a `0.2.0`, and the release note should lead with the URL-execution change.
 - **`pg_constraint` is read per SELECT.** Cheap (an OID-pair lookup, not the `information_schema` join), but it is an extra round trip on every navigation. Unlike `information_schema`, `pg_constraint` is not privilege-filtered, so FK links won't silently vanish under a non-owner read-only login.
+- **`MAX_ROWS` clips the response, not the fetch.** `pool.query` has already buffered the full result into the Node heap by the time we slice, so the cap bounds response size and DOM size but not peak memory. `statement_timeout` is what actually stands between a runaway query and an OOM; a cursor-based fetch would be the real fix.
 - **The inline frontend script is neither linted nor typechecked** (`jsconfig.json` covers only `src/**/*.js`), so frontend regressions are caught only by e2e.
 - **Existing specs and `tests/e2e/helpers/api.js` break by design.** `selectTable` waits on `/api/tables/:name/rows`, which will no longer exist — the failure mode is a 30s hang, not a fast failure. Part 3 is a gate, not cleanup.
