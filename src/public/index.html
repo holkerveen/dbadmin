@@ -71,20 +71,26 @@ function tableOfQuery(sql) {
   return m ? m[1].toLowerCase() : null
 }
 
+const GENERATED_RE = /^select \* from ("?[a-z_][a-z0-9_$]*"?)(?: where (.+?))? limit (\d+) offset (\d+)$/i
+
 /**
  * Recognise the exact shape this app generates, so the pager only ever
  * rewrites SQL we built ourselves. Hand-typed SQL returns null and runs as-is.
  * @returns {{table: string, where: string|null, limit: number, offset: number}|null}
  */
 function parseGenerated(sql) {
-  // STUB (wave 1): match `select * from <t> [where <clause>] limit <n> offset <m>`.
-  void sql
-  return null
+  const m = GENERATED_RE.exec(sql.trim())
+  if (!m) return null
+  const [, table, where, limit, offset] = m
+  // A parenthesis or `;` in the where clause means this isn't a where clause
+  // we generated ourselves (the FK link builder never emits either) - reject
+  // so hand-typed SQL can't masquerade as the generated shape and get rewritten.
+  if (where && /[();]/.test(where)) return null
+  return { table, where: where ? where.trim() : null, limit: Number(limit), offset: Number(offset) }
 }
 
 /** Inverse of parseGenerated. */
 function buildGenerated({ table, where, limit, offset }) {
-  // STUB (wave 1).
   return `select * from ${table}${where ? ' where ' + where : ''} limit ${limit} offset ${offset}`
 }
 
@@ -128,10 +134,20 @@ function renderRows(rows, fks) {
     const tr = document.createElement('tr')
     cols.forEach((c) => {
       const td = document.createElement('td')
-      // STUB (wave 1): when fks[c] exists and row[c] is not null, render an
-      // <a href> to `select * from <fk.table> where <fk.column> = <literal>`.
-      void fks
-      td.textContent = row[c]
+      const fk = fks[c]
+      if (fk && row[c] != null) {
+        const a = document.createElement('a')
+        a.textContent = row[c]
+        a.href = queryHref(buildGenerated({
+          table: fk.table,
+          where: `${fk.column} = ${sqlLiteral(row[c], fk.quote)}`,
+          limit: LIMIT,
+          offset: 0,
+        }))
+        td.appendChild(a)
+      } else {
+        td.textContent = row[c]
+      }
       tr.appendChild(td)
     })
     table.appendChild(tr)
@@ -143,9 +159,21 @@ function renderPager(query, rowCount, hasNext) {
   pager.innerHTML = ''
   const gen = parseGenerated(query)
   if (!gen) return
-  // STUB (wave 1): `<offset+1>-<offset+rowCount>` plus Prev/Next anchors.
-  void rowCount
-  void hasNext
+  const span = document.createElement('span')
+  span.textContent = rowCount === 0 ? '0-0' : `${gen.offset + 1}-${gen.offset + rowCount}`
+  pager.appendChild(span)
+  if (gen.offset > 0) {
+    const prev = document.createElement('a')
+    prev.textContent = 'Prev'
+    prev.href = queryHref(buildGenerated({ ...gen, offset: Math.max(0, gen.offset - gen.limit) }))
+    pager.appendChild(prev)
+  }
+  if (hasNext) {
+    const next = document.createElement('a')
+    next.textContent = 'Next'
+    next.href = queryHref(buildGenerated({ ...gen, offset: gen.offset + gen.limit }))
+    pager.appendChild(next)
+  }
 }
 
 function clearMain() {
