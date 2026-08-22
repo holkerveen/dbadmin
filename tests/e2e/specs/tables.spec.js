@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test'
-import { selectTable } from '../helpers/api.js'
+import { selectTable, activeTable } from '../helpers/api.js'
 
 const EXPECTED_TABLES = ['categories', 'orders', 'pet_tags', 'pets', 'tags', 'users']
 
@@ -30,5 +30,5 @@ test('selecting pets shows its columns as headers', async ({ page }) => {
 test('selecting a table highlights it as active', async ({ page }) => {
   await page.goto('/')
   await selectTable(page, 'orders')
-  await expect(page.locator('#tableList li', { hasText: 'orders' })).toHaveClass(/active/)
+  await expect(activeTable(page)).toHaveText('orders')
 })

@@ -1,7 +1,7 @@
 {
   "name": "dbadmin",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Web-based PostgreSQL viewer: browse tables, inspect columns, page through rows, and run SQL from a single page.",
   "license": "Apache-2.0",
   "type": "module",

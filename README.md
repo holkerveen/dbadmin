@@ -80,11 +80,26 @@ Express 5 server (`src/index.js`) exposes:
 
 - `GET /api/tables` — table list via `information_schema.tables`
 - `GET /api/tables/:name/columns` — column introspection via `information_schema.columns`
-- `GET /api/tables/:name/rows` — paginated row browsing (`limit`/`offset`, capped at 1000)
-- `POST /api/query` — runs arbitrary SQL from the request body directly against the database. This is an intentionally unsanitized SQL console, not a safe multi-tenant API — don't expose it to untrusted users.
+- `POST /api/query` — runs SQL from the request body directly against the database. This is an intentionally unsanitized SQL console, not a safe multi-tenant API — don't expose it to untrusted users. Takes `{ sql, readOnly }`; with `readOnly: true` the statement runs inside a `BEGIN READ ONLY` transaction, so PostgreSQL itself rejects writes. Returns at most 1000 rows (`truncated: true` when it clipped), plus an `fks` map describing which result columns are foreign keys.
 - `GET /healthz` — runs `SELECT 1`; used by Docker `HEALTHCHECK`, Compose readiness (`service_healthy`), and `dbadmin.sh`'s test-stack polling.
 
+The pool sets `statement_timeout` (30s, override with `STATEMENT_TIMEOUT_MS`) so a runaway query fails instead of pinning a connection.
+
 The frontend (`src/public/index.html`) is a single static file: vanilla JS/CSS, no framework, no bundler.
+
+### Navigation and URLs
+
+The URL is the state. Everything in the main area is described by `?q=<url-encoded SQL>`, so any view can be bookmarked, shared, or reached with the browser's Back and Forward buttons — no page reloads. Clicking a table in the sidebar goes to `/?q=select%20*%20from%20pets%20limit%20100%20offset%200`; the pager's Prev/Next are ordinary links that differ only in their `offset`.
+
+Foreign keys are click-through. The server resolves each result column's origin from the field metadata PostgreSQL returns with every result set, so `pets.category_id` renders as a link to `?q=select * from categories where id = 6 limit 100 offset 0` — and it keeps working through joins and column aliases. Every navigable element is a real `<a href>`, so middle-click, ctrl-click, and Copy Link Address behave as expected; one delegated click handler intercepts plain left-clicks.
+
+Two rules are worth knowing:
+
+- **SQL that arrives via the URL always executes read-only.** Opening a URL is therefore never destructive, and Back can never re-run a mutation. Writes are still available from the Run button — they execute and report the row count, but they are deliberately not written into the URL or history.
+- **Only queries the app generated are ever rewritten.** The pager appears for the `select * from <table> [where …] limit <n> offset <m>` shape and nothing else. SQL you typed runs byte-for-byte, so a trailing semicolon or your own `LIMIT 10` is never silently altered.
+
+> [!NOTE]
+> Because queries travel in the URL, they also land in browser history and in the access logs of any reverse proxy in front of the container — a different exposure from the network reachability discussed above. Bear it in mind if you query anything sensitive.
 
 ## Database schema
 
@@ -104,7 +119,7 @@ Two containerized e2e targets, both driven by Playwright against `tests/e2e/`:
 
 Each run: builds and starts an ephemeral postgres + dbadmin stack (own Compose project name, own ports — won't collide with `./dbadmin.sh dev` or with each other), waits for `/healthz`, applies the schema, seeds it, runs the full Playwright suite (`tests/e2e/specs/*.spec.js`), then tears the stack down — even on failure. The script's own exit code reflects Playwright's, so it's CI-ready as-is.
 
-Specs cover the app's main surface: the table sidebar and column introspection, paginated row browsing against the seeded counts, and the SQL console (a `SELECT`, a mutating `UPDATE` asserting `OK: N row(s) changed`, and an invalid query's error path).
+Specs cover the app's main surface: the table sidebar and column introspection, paginated row browsing against the seeded counts, the SQL console (a `SELECT`, a mutating `UPDATE` asserting `OK: N row(s) changed`, and an invalid query's error path), and URL-driven navigation (bookmarking, Back/Forward, foreign-key click-through, and the refusal of a write that arrives via the URL).
 
 `tests/e2e/` is deliberately nested under `tests/` so `tests/unit/`, `tests/integration/`, and `tests/feature/` can be added later as clean siblings.
 
